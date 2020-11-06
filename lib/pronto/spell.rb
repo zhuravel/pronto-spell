@@ -7,6 +7,14 @@ module Pronto
   class Spell < Runner
     CONFIG_FILE = '.pronto_spell.yml'
 
+    def whitelist
+      @whitelist ||= (spelling_config['whitelist'] || []).map { |matcher| regexpify(matcher) }
+    end
+
+    def files_to_lint
+      @files_to_lint ||= regexpify(spelling_config['files_to_lint'] || '\\.rb$')
+    end
+
     def ignored_words
       @ignored_words ||= begin
         Set.new(spelling_config['ignored_words'].to_a.map(&:downcase))
@@ -22,8 +30,10 @@ module Pronto
     def run
       return [] if !@patches || @patches.count.zero?
 
+      @all_symbols = Symbol.all_symbols
+
       @patches
-        .select { |patch| patch.additions.positive? }
+        .select { |patch| patch.additions.positive? && lintable_file?(patch.new_file_full_path) }
         .map { |patch| inspect(patch) }
         .flatten.compact
     end
@@ -36,10 +46,7 @@ module Pronto
           next
         end
 
-        words = line.content.scan(/([A-Z]{2,})|([A-Z]{0,1}[a-z]+)/)
-          .flatten.compact.uniq
-
-        words
+        extract_words(line.content)
           .select { |word| misspelled?(word) }
           .map { |word| new_message(word, line) }
       end
@@ -47,7 +54,7 @@ module Pronto
 
     def new_message(word, line)
       path = line.patch.delta.new_file[:path]
-      level = :warning
+      level = :info
 
       suggestions = speller.suggestions(word)
 
@@ -98,12 +105,40 @@ module Pronto
     end
 
     def misspelled?(word)
-      lintable_word?(word) && !speller.correct?(word)
+      lintable_word?(word) && !speller.correct?(word) && !speller.correct?(singularize(word))
     end
 
     def lintable_word?(word)
       (min_word_length..max_word_length).cover?(word.length) &&
-        !ignored_words.include?(word.downcase)
+        !ignored_words.include?(word.downcase) &&
+        !symbol_defined?(word) && !whitelist.any? { |regexp| regexp =~ word }
+    end
+
+    def lintable_file?(path)
+      files_to_lint =~ path.to_s
+    end
+
+    def singularize(word)
+      word.sub(/(e?s|\d+)\z/, '')
+    end
+
+    def regexpify(matcher)
+      Regexp.new(matcher, Regexp::IGNORECASE)
+    end
+
+    def symbol_defined?(symbol)
+      @all_symbols.include?(symbol.to_sym)
+    end
+
+    def extract_words(content)
+      content.scan(/[0-9a-zA-Z]+/).grep(/\A[a-zA-Z]+\z/).flat_map do |word|
+        # Recognize acronyms embedded in the CamelCase:
+        # for example, split "MyHTMLTricks" into "My HTML Tricks" instead of "My H T M L Tricks".
+        word.
+          gsub(/([[:lower:]\\d])([[:upper:]])/, '\1 \2').
+          gsub(/([^-\\d])(\\d[-\\d]*( |$))/,'\1 \2').
+          gsub(/([[:upper:]])([[:upper:]][[:lower:]\\d])/, '\1 \2').split
+      end.uniq
     end
   end
 end
